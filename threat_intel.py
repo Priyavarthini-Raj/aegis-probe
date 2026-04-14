@@ -1,265 +1,293 @@
 # threat_intel.py
-# Threat intelligence using local Nmap scanning
-# Free, unlimited, no API key needed!
+# Cloud-safe Nmap threat intelligence
+# Works on local machine AND Streamlit Cloud
 
-import nmap
 import socket
 import requests
+import streamlit as st
+
+# ── Try to import nmap safely ──
+# On Streamlit Cloud, nmap may not be available
+# So we wrap it in try/except
+try:
+    import nmap
+    NMAP_AVAILABLE = True
+except ImportError:
+    NMAP_AVAILABLE = False
+
+# ── Dangerous ports reference ──
+DANGEROUS_PORTS = {
+    21:   "FTP — File Transfer (data theft risk)",
+    22:   "SSH — Secure Shell (brute force target)",
+    23:   "Telnet — Unencrypted remote access",
+    25:   "SMTP — Mail server (spam/phishing)",
+    80:   "HTTP — Web server",
+    443:  "HTTPS — Encrypted web",
+    445:  "SMB — File sharing (ransomware spread)",
+    1433: "MSSQL — Database (SQL injection risk)",
+    1723: "PPTP VPN — Tunneling",
+    3306: "MySQL — Database exposed",
+    3389: "RDP — Remote Desktop (takeover risk)",
+    4444: "Metasploit default — Likely backdoor!",
+    5900: "VNC — Remote control",
+    6379: "Redis — Database exposed",
+    8080: "HTTP Alternate — Web proxy",
+    8443: "HTTPS Alternate — Suspicious web",
+    8888: "Jupyter/Custom — Code execution risk",
+    9200: "Elasticsearch — Data exposure",
+}
+
+HIGH_RISK_PORTS = {21, 22, 23, 445, 1433, 3306, 3389, 4444, 5900}
+
+TOR_KEYWORDS = ["tor", "exit", "relay", "anonymize", "for-privacy", "torservers"]
 
 
-def check_nmap(ip):
+def is_private_ip(ip):
+    """Check if IP is private/local"""
+    private_prefixes = [
+        "10.", "192.168.", "127.", "172.16.", "172.17.",
+        "172.18.", "172.19.", "172.20.", "172.21.", "172.22.",
+        "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
+        "172.28.", "172.29.", "172.30.", "172.31.", "0.", "::1"
+    ]
+    return any(ip.startswith(p) for p in private_prefixes)
+
+
+def get_hostname(ip):
+    """Get hostname via reverse DNS"""
+    try:
+        hostname = socket.gethostbyaddr(ip)[0]
+        return hostname
+    except Exception:
+        return None
+
+
+def is_tor_node(hostname):
+    """Check if hostname indicates Tor exit node"""
+    if not hostname:
+        return False
+    h = hostname.lower()
+    return any(kw in h for kw in TOR_KEYWORDS)
+
+
+def scan_with_nmap(ip):
     """
-    Uses local Nmap to scan open ports and services on the IP
-    Free and unlimited — runs on your machine!
+    Scan IP using local Nmap.
+    Returns dict of open ports.
+    Only runs if Nmap is available.
     """
-    print(f"\n[*] Scanning {ip} with Nmap...")
+    if not NMAP_AVAILABLE:
+        return {}
 
     try:
-        # Skip private IPs
-        private_ranges = ["192.168.", "10.", "172.16.", "127.", "0."]
-        for private in private_ranges:
-            if ip.startswith(private):
-                print(f"[!] {ip} is private — skipping Nmap")
-                return None
+        scanner = nmap.PortScanner()
+        # Fast scan: top 100 ports, T4 speed, only open
+        scanner.scan(ip, arguments="-F -T4 --open", timeout=60)
 
-        # Initialize Nmap scanner
-        nm = nmap.PortScanner()
-
-        # Scan top 100 common ports (-F = fast scan)
-        print(f"[*] Running fast port scan on {ip}...")
-        nm.scan(ip, arguments="-F -T4 --open")
-
-        open_ports = []
-        port_details = []
-
-        if ip in nm.all_hosts():
-            for proto in nm[ip].all_protocols():
-                ports = nm[ip][proto].keys()
-                for port in sorted(ports):
-                    state = nm[ip][proto][port]["state"]
-                    if state == "open":
-                        service = nm[ip][proto][port].get("name", "unknown")
-                        version = nm[ip][proto][port].get("version", "")
-                        open_ports.append(port)
-                        port_details.append({
-                            "port": port,
-                            "service": service,
-                            "version": version,
-                            "state": state
-                        })
-
-        # ── Reverse DNS ──
-        hostname = ""
-        try:
-            hostname = socket.gethostbyaddr(ip)[0]
-        except:
-            hostname = ""
-
-        # ── Tor Detection ──
-        is_tor = any(
-            keyword in hostname.lower()
-            for keyword in ["tor", "exit", "relay", "anonymize"]
-        )
-
-        # ── Dangerous Port Detection ──
-        dangerous_ports_map = {
-            22: "SSH", 23: "Telnet",
-            3389: "RDP", 445: "SMB",
-            1433: "MSSQL", 3306: "MySQL",
-            21: "FTP", 5900: "VNC",
-            4444: "Metasploit", 1080: "SOCKS Proxy",
-            8080: "HTTP Proxy", 8443: "HTTPS Alt"
-        }
-        found_dangerous = [
-            f"{dangerous_ports_map[p]} ({p})"
-            for p in open_ports
-            if p in dangerous_ports_map
-        ]
-
-        result = {
-            "ip": ip,
-            "open_ports": open_ports[:15],
-            "port_details": port_details[:15],
-            "found_dangerous": found_dangerous,
-            "hostname": hostname,
-            "is_tor": is_tor,
-            "is_risky": len(found_dangerous) > 0 or is_tor,
-            "scan_status": "success"
-        }
-
-        print(f"[+] Nmap: {len(open_ports)} open ports found")
-        if is_tor:
-            print(f"[!] TOR EXIT NODE DETECTED!")
-        if found_dangerous:
-            print(f"[!] Dangerous ports: {found_dangerous}")
-
-        return result
-
-    except nmap.PortScannerError as e:
-        print(f"[!] Nmap error: {e}")
-        return {
-            "ip": ip,
-            "error": "Nmap not found — please install from nmap.org"
-        }
-
+        open_ports = {}
+        if ip in scanner.all_hosts():
+            host = scanner[ip]
+            for proto in host.all_protocols():
+                ports = host[proto].keys()
+                for port in ports:
+                    state = host[proto][port]['state']
+                    if state == 'open':
+                        service = host[proto][port].get('name', 'unknown')
+                        open_ports[port] = service
+        return open_ports
     except Exception as e:
-        print(f"[!] Scan failed: {e}")
-        return {"ip": ip, "error": str(e)}
+        return {}
 
 
-def run_nmap_probes(ips):
+def render_threat_intel(st_obj, ips):
     """
-    Runs Nmap scan on a list of IPs
+    Main function called from app.py
+    Works on both local machine and Streamlit Cloud
     """
-    results = []
-    for ip in ips:
-        result = {
-            "ip": ip,
-            "nmap": check_nmap(ip)
-        }
-        results.append(result)
-    return results
 
-
-def render_threat_intel(st, ips):
-    """
-    Renders Nmap scan results in Streamlit
-    """
     if not ips:
-        st.info("No IPs to check.")
+        st_obj.info("No IP addresses found to scan.")
         return
 
-    st.markdown("### 🎯 Nmap Port Intelligence")
-    st.caption(
-        "Local port scanning — free, unlimited, "
-        "industry standard tool!"
-    )
+    # Filter out private IPs
+    public_ips = [ip for ip in ips if not is_private_ip(ip)]
 
-    with st.spinner(
-        "🔍 Scanning ports with Nmap — this may take 30-60 seconds..."
-    ):
-        results = run_nmap_probes(ips)
+    if not public_ips:
+        st_obj.markdown("""
+        <div style='background:rgba(245,158,11,0.08);
+                    border:1px solid rgba(245,158,11,0.2);
+                    border-radius:12px;padding:16px 20px;'>
+            <div style='font-family:Exo 2,sans-serif;font-size:13px;color:#f59e0b;'>
+                ⚠️ All detected IPs are private/local ranges
+                (192.168.x.x, 10.x.x, 127.x.x).
+                Nmap scanning skipped — private IPs cannot be scanned externally.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
 
-    for result in results:
-        ip = result["ip"]
-        nmap_data = result.get("nmap")
+    # Show cloud warning if Nmap not available
+    if not NMAP_AVAILABLE:
+        st_obj.markdown("""
+        <div style='background:rgba(99,102,241,0.08);
+                    border:1px solid rgba(99,102,241,0.2);
+                    border-radius:12px;padding:16px 20px;margin-bottom:16px;'>
+            <div style='font-family:Exo 2,sans-serif;font-size:14px;
+                        font-weight:700;color:#818cf8;margin-bottom:6px;'>
+                📡 NMAP CLOUD MODE
+            </div>
+            <div style='font-family:Exo 2,sans-serif;font-size:13px;color:#6b7280;'>
+                Nmap port scanning is limited on cloud deployment.
+                Showing DNS intelligence and known port risk analysis instead.
+                For full port scanning, run Aegis Probe locally on your machine.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-        st.markdown(f"#### 🌐 IP: `{ip}`")
+    # Process each public IP
+    for ip in public_ips[:3]:  # Max 3 IPs to keep it fast
 
-        if nmap_data is None:
-            st.info("ℹ️ Private IP — scan skipped")
-            st.divider()
-            continue
+        st_obj.markdown(f"""
+        <div style='background:rgba(0,10,20,0.6);
+                    border:1px solid rgba(0,212,255,0.12);
+                    border-radius:14px;padding:20px;margin-bottom:16px;'>
+            <div style='font-family:Share Tech Mono,monospace;font-size:13px;
+                        color:#00d4ff;margin-bottom:14px;
+                        text-shadow:0 0 10px rgba(0,212,255,0.3);'>
+                🎯 SCANNING: {ip}
+            </div>
+        """, unsafe_allow_html=True)
 
-        if "error" in nmap_data:
-            st.warning(f"⚠️ {nmap_data['error']}")
-            st.divider()
-            continue
+        # 1. Hostname / Tor detection
+        hostname = get_hostname(ip)
+        tor = is_tor_node(hostname)
 
-        # ── Tor Warning ──
-        if nmap_data.get("is_tor"):
-            st.error(
-                "🧅 TOR EXIT NODE DETECTED — "
-                "Attacker hiding identity via Tor network!"
-            )
+        if tor:
+            st_obj.markdown(f"""
+            <div style='background:rgba(239,68,68,0.1);
+                        border:1px solid rgba(239,68,68,0.3);
+                        border-radius:10px;padding:14px 18px;margin-bottom:12px;
+                        box-shadow:0 0 20px rgba(239,68,68,0.1);'>
+                <div style='font-family:Rajdhani,sans-serif;font-size:18px;
+                            font-weight:700;color:#ef4444;letter-spacing:2px;
+                            text-shadow:0 0 15px rgba(239,68,68,0.4);'>
+                    🧅 TOR EXIT NODE DETECTED — CRITICAL RISK
+                </div>
+                <div style='font-family:Share Tech Mono,monospace;font-size:12px;
+                            color:rgba(239,68,68,0.7);margin-top:6px;'>
+                    HOSTNAME: {hostname}
+                </div>
+                <div style='font-family:Exo 2,sans-serif;font-size:12px;
+                            color:#6b7280;margin-top:4px;'>
+                    This IP is a Tor exit node. Attacker is hiding real identity
+                    through the Tor anonymity network. Extremely high risk.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        elif hostname:
+            st_obj.markdown(f"""
+            <div style='background:rgba(0,212,255,0.04);
+                        border:1px solid rgba(0,212,255,0.1);
+                        border-radius:8px;padding:10px 14px;margin-bottom:12px;'>
+                <div style='font-family:Share Tech Mono,monospace;font-size:12px;
+                            color:#4a7090;'>
+                    🔗 HOSTNAME: {hostname}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-        # ── Metrics ──
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            st.metric(
-                "Open Ports",
-                len(nmap_data.get("open_ports", []))
-            )
-        with m2:
-            st.metric(
-                "Dangerous Ports",
-                len(nmap_data.get("found_dangerous", []))
-            )
-        with m3:
-            hostname = nmap_data.get("hostname", "N/A") or "N/A"
-            st.metric(
-                "Hostname",
-                hostname[:20] if hostname != "N/A" else "N/A"
-            )
+        # 2. Nmap scan (local only)
+        if NMAP_AVAILABLE:
+            with st_obj.spinner(f"Scanning {ip} with Nmap..."):
+                open_ports = scan_with_nmap(ip)
 
-        # ── Port Details ──
-        c1, c2 = st.columns(2)
+            if open_ports:
+                st_obj.markdown("""
+                <div style='font-family:Share Tech Mono,monospace;font-size:10px;
+                            color:#4a7090;letter-spacing:2px;margin-bottom:8px;'>
+                    OPEN PORTS DETECTED:
+                </div>
+                """, unsafe_allow_html=True)
 
-        with c1:
-            st.markdown("**📡 Open Ports & Services:**")
-            if nmap_data.get("port_details"):
-                for pd in nmap_data["port_details"]:
-                    version = f" — {pd['version']}" \
-                        if pd.get("version") else ""
-                    st.markdown(
-                        f"`{pd['port']}` {pd['service']}{version}"
+                cols = st_obj.columns(min(len(open_ports), 4))
+                for i, (port, service) in enumerate(open_ports.items()):
+                    is_risky = port in HIGH_RISK_PORTS
+                    danger_desc = DANGEROUS_PORTS.get(
+                        port, f"{service.upper()} — Verify necessity"
+                    )
+                    with cols[i % 4]:
+                        st_obj.markdown(f"""
+                        <div style='background:{"rgba(239,68,68,0.08)" if is_risky else "rgba(16,185,129,0.06)"};
+                                    border:1px solid {"rgba(239,68,68,0.25)" if is_risky else "rgba(16,185,129,0.15)"};
+                                    border-radius:10px;padding:12px;text-align:center;'>
+                            <div style='font-family:Rajdhani,sans-serif;font-size:22px;
+                                        font-weight:700;
+                                        color:{"#ef4444" if is_risky else "#10b981"};'>
+                                {port}
+                            </div>
+                            <div style='font-family:Share Tech Mono,monospace;font-size:10px;
+                                        color:{"#ef4444" if is_risky else "#10b981"};
+                                        margin-bottom:4px;'>
+                                {service.upper()}
+                            </div>
+                            <div style='font-family:Exo 2,sans-serif;font-size:10px;
+                                        color:#4a7090;'>
+                                {"⚠️ HIGH RISK" if is_risky else "✓ Open"}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                # Risk summary
+                risky = [p for p in open_ports if p in HIGH_RISK_PORTS]
+                if risky:
+                    risky_names = [
+                        f"Port {p} ({DANGEROUS_PORTS.get(p, 'Unknown')})"
+                        for p in risky
+                    ]
+                    st_obj.error(
+                        f"🚨 {len(risky)} HIGH RISK port(s) found: "
+                        + ", ".join(risky_names[:3])
                     )
             else:
-                st.info("No open ports found")
+                st_obj.markdown("""
+                <div style='font-family:Share Tech Mono,monospace;font-size:12px;
+                            color:#10b981;padding:8px 0;'>
+                    ✓ No high-risk ports detected in top 100 scan
+                </div>
+                """, unsafe_allow_html=True)
 
-        with c2:
-            st.markdown("**⚠️ Dangerous Ports:**")
-            if nmap_data.get("found_dangerous"):
-                for dp in nmap_data["found_dangerous"]:
-                    st.error(f"🚨 {dp}")
-            else:
-                st.success("✅ No dangerous ports found")
+        else:
+            # Cloud mode — show known port info without scanning
+            st_obj.markdown("""
+            <div style='font-family:Share Tech Mono,monospace;font-size:11px;
+                        color:#4a7090;letter-spacing:1px;margin-bottom:8px;'>
+                ⬡ COMMON HIGH-RISK PORTS TO INVESTIGATE MANUALLY:
+            </div>
+            """, unsafe_allow_html=True)
 
-            hostname = nmap_data.get("hostname", "")
-            if hostname:
-                st.markdown(f"**🌐 Hostname:** `{hostname}`")
-                if nmap_data.get("is_tor"):
-                    st.markdown("""
-                    <div style='background:#3d0000;
-                                border:1px solid #f85149;
-                                border-radius:8px;
-                                padding:10px; margin-top:8px;'>
-                        <b style='color:#ffa198;'>🧅 TOR EXIT NODE</b><br>
-                        <span style='color:#ffa198; font-size:12px;'>
-                        Real attacker identity hidden via Tor
-                        </span>
+            port_cols = st_obj.columns(4)
+            risky_ports_display = [
+                (22, "SSH", True), (3389, "RDP", True),
+                (445, "SMB", True), (4444, "Backdoor", True)
+            ]
+            for i, (port, service, risky) in enumerate(risky_ports_display):
+                with port_cols[i]:
+                    st_obj.markdown(f"""
+                    <div style='background:rgba(239,68,68,0.06);
+                                border:1px solid rgba(239,68,68,0.2);
+                                border-radius:8px;padding:10px;text-align:center;'>
+                        <div style='font-family:Rajdhani,sans-serif;font-size:20px;
+                                    font-weight:700;color:#ef4444;'>{port}</div>
+                        <div style='font-family:Share Tech Mono,monospace;font-size:10px;
+                                    color:#ef4444;'>{service}</div>
+                        <div style='font-family:Exo 2,sans-serif;font-size:9px;
+                                    color:#4a7090;margin-top:2px;'>Check manually</div>
                     </div>
                     """, unsafe_allow_html=True)
 
-        # ── Risk Banner ──
-        st.markdown("")
-        if nmap_data.get("is_tor"):
-            st.error(
-                "🔴 CRITICAL — TOR EXIT NODE! "
-                "Attacker hiding real identity via Tor!"
+            st_obj.info(
+                "💡 For full Nmap port scanning, run Aegis Probe locally "
+                "on your Windows machine where Nmap 7.99 is installed."
             )
-        elif nmap_data.get("found_dangerous"):
-            st.error(
-                f"🔴 HIGH RISK — Dangerous ports open: "
-                f"{', '.join(nmap_data['found_dangerous'])}"
-            )
-        elif nmap_data.get("open_ports"):
-            st.warning(
-                "🟡 MODERATE — Open ports detected, monitor closely"
-            )
-        else:
-            st.success("🟢 No open ports or risks detected")
 
-        st.divider()
-
-
-# Test it
-if __name__ == "__main__":
-    test_ips = ["185.220.101.45", "45.155.205.233"]
-
-    for test_ip in test_ips:
-        print(f"\n{'='*40}")
-        print(f"Scanning {test_ip} with Nmap...")
-        result = check_nmap(test_ip)
-
-        if result and "error" not in result:
-            print(f"IP             : {result['ip']}")
-            print(f"Open Ports     : {result['open_ports']}")
-            print(f"Dangerous Ports: {result['found_dangerous']}")
-            print(f"Hostname       : {result['hostname']}")
-            print(f"Is Tor         : {result['is_tor']}")
-            print(f"Is Risky       : {result['is_risky']}")
-        elif result:
-            print(f"Info: {result['error']}")
-        else:
-            print("Scan failed")
+        st_obj.markdown("</div>", unsafe_allow_html=True)
